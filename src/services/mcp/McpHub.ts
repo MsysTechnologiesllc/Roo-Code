@@ -1753,7 +1753,7 @@ export class McpHub {
 			timeout = 60 * 1000
 		}
 
-		return await connection.client.request(
+		const result = await connection.client.request(
 			{
 				method: "tools/call",
 				params: {
@@ -1766,6 +1766,7 @@ export class McpHub {
 				timeout,
 			},
 		)
+		return result as unknown as McpToolCallResponse
 	}
 
 	/**
