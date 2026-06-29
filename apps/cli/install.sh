@@ -7,6 +7,9 @@
 #   ROO_BIN_DIR       - Binary symlink directory (default: ~/.local/bin)
 #   ROO_VERSION       - Specific version to install (default: latest)
 #   ROO_LOCAL_TARBALL - Path to local tarball to install (skips download)
+#   ROO_INSTALL_ATLAS - Install/configure Atlas MCP by default (1=true, 0=false)
+#   ROO_ATLAS_VERSION - Atlas version to install (default: latest release)
+#   ROO_ATLAS_REPO    - Atlas GitHub repo (default: dominic097/atlas)
 
 set -e
 
@@ -14,6 +17,8 @@ set -e
 INSTALL_DIR="${ROO_INSTALL_DIR:-$HOME/.roo/cli}"
 BIN_DIR="${ROO_BIN_DIR:-$HOME/.local/bin}"
 REPO="RooCodeInc/Roo-Code"
+ATLAS_REPO="${ROO_ATLAS_REPO:-dominic097/atlas}"
+ATLAS_SERVER_NAME="${ROO_ATLAS_MCP_SERVER_NAME:-pulse-atlas}"
 MIN_NODE_VERSION=20
 
 # Color output (only if terminal supports it)
@@ -263,6 +268,164 @@ setup_bin() {
     info "Created symlink: $BIN_DIR/roo"
 }
 
+atlas_enabled() {
+    case "${ROO_INSTALL_ATLAS:-1}" in
+        0|false|FALSE|no|NO) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+atlas_release_arch() {
+    case "$ARCH" in
+        x64) printf "amd64" ;;
+        arm64) printf "arm64" ;;
+        *) printf "%s" "$ARCH" ;;
+    esac
+}
+
+latest_atlas_version() {
+    curl -fsSL "https://api.github.com/repos/$ATLAS_REPO/releases/latest" 2>/dev/null | node -e '
+const fs = require("fs")
+let release
+try {
+  release = JSON.parse(fs.readFileSync(0, "utf8"))
+} catch {
+  process.exit(1)
+}
+const tag = String(release.tag_name || "").trim()
+if (!tag) process.exit(1)
+process.stdout.write(tag.replace(/^v/, ""))
+'
+}
+
+install_atlas() {
+    if ! atlas_enabled; then
+        warn "Skipping Atlas install/configuration because ROO_INSTALL_ATLAS=0"
+        return
+    fi
+
+    if command -v atlas >/dev/null 2>&1; then
+        ATLAS_COMMAND="$(command -v atlas)"
+        info "Found Atlas at $ATLAS_COMMAND"
+        return
+    fi
+
+    ATLAS_VERSION="${ROO_ATLAS_VERSION:-}"
+    if [ -z "$ATLAS_VERSION" ] || [ "$ATLAS_VERSION" = "latest" ]; then
+        info "Fetching latest Atlas version..."
+        ATLAS_VERSION="$(latest_atlas_version)" || {
+            error "Failed to resolve latest Atlas release from $ATLAS_REPO. Set ROO_INSTALL_ATLAS=0 to skip."
+        }
+    fi
+    ATLAS_VERSION="${ATLAS_VERSION#v}"
+    ATLAS_ARCH="$(atlas_release_arch)"
+    ATLAS_TARBALL="atlas_${ATLAS_VERSION}_${OS}_${ATLAS_ARCH}.tar.gz"
+    ATLAS_URL="https://github.com/$ATLAS_REPO/releases/download/v${ATLAS_VERSION}/${ATLAS_TARBALL}"
+
+    info "Installing Atlas $ATLAS_VERSION from $ATLAS_URL..."
+    ATLAS_TMP_DIR="$(mktemp -d)"
+    curl -fsSL "$ATLAS_URL" -o "$ATLAS_TMP_DIR/$ATLAS_TARBALL" || {
+        rm -rf "$ATLAS_TMP_DIR"
+        error "Failed to download Atlas for $OS/$ATLAS_ARCH. Set ROO_INSTALL_ATLAS=0 to skip."
+    }
+    tar -xzf "$ATLAS_TMP_DIR/$ATLAS_TARBALL" -C "$ATLAS_TMP_DIR" || {
+        rm -rf "$ATLAS_TMP_DIR"
+        error "Failed to extract Atlas archive."
+    }
+    if [ ! -f "$ATLAS_TMP_DIR/atlas" ]; then
+        rm -rf "$ATLAS_TMP_DIR"
+        error "Atlas archive did not contain an atlas binary."
+    fi
+    mkdir -p "$BIN_DIR"
+    cp "$ATLAS_TMP_DIR/atlas" "$BIN_DIR/atlas"
+    chmod +x "$BIN_DIR/atlas"
+    rm -rf "$ATLAS_TMP_DIR"
+    ATLAS_COMMAND="$BIN_DIR/atlas"
+    info "Installed Atlas: $ATLAS_COMMAND"
+}
+
+configure_atlas_mcp() {
+    if ! atlas_enabled; then
+        return
+    fi
+
+    if [ -z "$ATLAS_COMMAND" ]; then
+        ATLAS_COMMAND="$(command -v atlas 2>/dev/null || true)"
+    fi
+    if [ -z "$ATLAS_COMMAND" ]; then
+        error "Atlas command is unavailable after install."
+    fi
+
+    info "Configuring $ATLAS_SERVER_NAME MCP defaults for FusionX/Roo..."
+    ATLAS_COMMAND="$ATLAS_COMMAND" ATLAS_SERVER_NAME="$ATLAS_SERVER_NAME" node <<'NODE'
+const fs = require("fs")
+const os = require("os")
+const path = require("path")
+
+const command = process.env.ATLAS_COMMAND
+const serverName = process.env.ATLAS_SERVER_NAME || "pulse-atlas"
+const tools = [
+  "context",
+  "search",
+  "semantic_search",
+  "symbol",
+  "callers",
+  "neighbors",
+  "path",
+  "refs",
+  "explain",
+  "impact",
+  "cross_repo_impact",
+  "status",
+]
+
+function defaultStorageDirs() {
+  const explicit = String(process.env.ROO_ATLAS_MCP_STORAGE_DIRS || "").trim()
+  if (explicit) return explicit.split(path.delimiter).filter(Boolean)
+
+  const home = os.homedir()
+  if (process.platform === "darwin") {
+    const base = path.join(home, "Library", "Application Support", "Code", "User", "globalStorage")
+    return [path.join(base, "aziro.fusionx"), path.join(base, "aziro.fusionx-cline")]
+  }
+  return [
+    path.join(home, ".config", "Code", "User", "globalStorage", "aziro.fusionx"),
+    path.join(home, ".local", "share", "code-server", "User", "globalStorage", "aziro.fusionx"),
+  ]
+}
+
+const server = {
+  type: "stdio",
+  command,
+  args: ["mcp", "--transport", "stdio", "--db", "sqlite://${workspaceFolder}/.atlas/atlas.db"],
+  cwd: "${workspaceFolder}",
+  alwaysAllow: tools,
+  timeout: 120,
+}
+
+for (const dir of defaultStorageDirs()) {
+  const settingsDir = path.join(dir, "settings")
+  fs.mkdirSync(settingsDir, { recursive: true })
+  const file = path.join(settingsDir, "mcp_settings.json")
+  let root = {}
+  if (fs.existsSync(file)) {
+    try {
+      root = JSON.parse(fs.readFileSync(file, "utf8"))
+    } catch {
+      root = {}
+    }
+  }
+  if (!root || typeof root !== "object" || Array.isArray(root)) root = {}
+  if (!root.mcpServers || typeof root.mcpServers !== "object" || Array.isArray(root.mcpServers)) {
+    root.mcpServers = {}
+  }
+  root.mcpServers[serverName] = server
+  fs.writeFileSync(file, `${JSON.stringify(root, null, 2)}\n`)
+  console.log(`registered ${serverName} in ${file}`)
+}
+NODE
+}
+
 # Check if bin dir is in PATH and provide instructions
 check_path() {
     case ":$PATH:" in
@@ -310,6 +473,9 @@ verify_install() {
         # Just check if it runs without error
         "$BIN_DIR/roo" --version >/dev/null 2>&1 || true
     fi
+    if atlas_enabled && [ -n "$ATLAS_COMMAND" ]; then
+        "$ATLAS_COMMAND" version >/dev/null 2>&1 || warn "Atlas was installed but did not report a version"
+    fi
 }
 
 # Print success message
@@ -320,6 +486,9 @@ print_success() {
     echo "  Installation: $INSTALL_DIR"
     echo "  Binary: $BIN_DIR/roo"
     echo "  Version: $VERSION"
+    if atlas_enabled; then
+        echo "  Atlas MCP: $ATLAS_SERVER_NAME -> ${ATLAS_COMMAND:-atlas}"
+    fi
     echo ""
     echo "  ${BOLD}Get started:${NC}"
     echo "    roo --help"
@@ -345,6 +514,8 @@ main() {
     get_version
     download_and_install
     setup_bin
+    install_atlas
+    configure_atlas_mcp
     check_path
     verify_install
     print_success
